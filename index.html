@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Fibonacci Spiral</title>
+<style>
+  html,body{margin:0;height:100%;background:#01010a;overflow:hidden}
+  canvas{display:block;position:fixed;inset:0}
+  #title{position:fixed;left:18px;top:14px;color:rgba(190,210,255,.5);
+    font:600 13px/1 monospace;letter-spacing:.35em;user-select:none;pointer-events:none;
+    text-shadow:0 0 8px rgba(90,160,255,.8)}
+  #hint{position:fixed;left:18px;bottom:12px;color:rgba(160,180,255,.28);
+    font:12px/1.4 monospace;letter-spacing:.08em;user-select:none;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">NEON&nbsp;FIBONACCI</div>
+<div id="hint">click = burst palette &nbsp;&middot;&nbsp; space = pause &nbsp;&middot;&nbsp; R = restart</div>
+<script>
+'use strict';
+/* ============================================================
+   Neon Fibonacci spiral - drawn incrementally by a glowing pen.
+   - True Fibonacci-square construction: one quarter-arc per square,
+     tangent-continuous (C1), curled clockwise.
+   - Full redraw every frame: hue flows along the path, pulses,
+     and random palette events mutate it over time.
+   - Halo pass in 'lighter' at LOW lightness; saturated core pass in
+     'source-over' -> avoids the additive-blend white-out.
+   ============================================================ */
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, DPR = 1;
+var vignette = null;
+
+window.__probe = { frames: 0, drawn: 0, total: 0, err: null, spiral: null };
+
+/* ---------------- spiral geometry (abstract units) ---------------- */
+function buildSpiral() {
+  var F = [1, 1];
+  while (F[F.length - 1] < 233) F.push(F[F.length - 1] + F[F.length - 2]);
+  var N = F.length;
+  var sq = [{ x: 0, y: 0, s: 1 }];
+  var rect = { x: 0, y: 0, w: 1, h: 1 };
+  var k, s, d;
+  for (k = 1; k < N; k++) {
+    s = F[k]; d = (k - 1) % 4;
+    if (d === 0)      { sq.push({ x: rect.x + rect.w, y: rect.y, s: s });             rect.w += s; }
+    else if (d === 1) { sq.push({ x: rect.x, y: rect.y - s, s: s });                  rect.y -= s; rect.h += s; }
+    else if (d === 2) { sq.push({ x: rect.x - s, y: rect.y, s: s });                  rect.x -= s; rect.w += s; }
+    else              { sq.push({ x: rect.x, y: rect.y + rect.h, s: s });             rect.h += s; }
+  }
+
+  function corners(q) {
+    return [{ x: q.x, y: q.y }, { x: q.x + q.s, y: q.y },
+            { x: q.x + q.s, y: q.y + q.s }, { x: q.x, y: q.y + q.s }];
+  }
+  function shared(a, b) {
+    var ca = corners(a), cb = corners(b), out = [], i, j;
+    for (i = 0; i < 4; i++) for (j = 0; j < 4; j++)
+      if (ca[i].x === cb[j].x && ca[i].y === cb[j].y) out.push(ca[i]);
+    return out;
+  }
+  function isCorner(q, p) {
+    var c = corners(q), i;
+    for (i = 0; i < 4; i++) if (c[i].x === p.x && c[i].y === p.y) return true;
+    return false;
+  }
+
+  var arcs = [], err = null, cornersOK = true;
+  for (k = 1; k < N; k++) {
+    var entry = (k === 1) ? { x: 1, y: 1 } : shared(sq[k - 1], sq[k])[0];
+    var cc = corners(sq[k]), center = null, exit = null, i, cand, dx, dy;
+    for (i = 0; i < 4; i++) {
+      cand = cc[i];
+      dx = entry.x - cand.x; dy = entry.y - cand.y;
+      if (dx * dx + dy * dy !== sq[k].s * sq[k].s) continue;
+      exit = { x: cand.x + dy, y: cand.y - dx };      /* quarter sweep, clockwise */
+      if (!isCorner(sq[k], exit)) continue;
+      if (k < N - 1) {
+        var nxt = shared(sq[k], sq[k + 1])[0];
+        if (!nxt || nxt.x !== exit.x || nxt.y !== exit.y) { cornersOK = false; continue; }
+      }
+      center = cand; break;
+    }
+    if (!center) { err = 'arc ' + k + ' unmatched'; break; }
+    arcs.push({
+      cx: center.x, cy: center.y, r: sq[k].s,
+      a0: Math.atan2(entry.y - center.y, entry.x - center.x)
+    });
+  }
+  return { arcs: arcs, sq: sq, err: err, cornersOK: cornersOK, bounds: rect };
+}
+
+var GEO = buildSpiral();
+
+/* scale to fit + random per-run orientation */
+var view = { scale: 1, cx: 0, cy: 0 };
+var rot = 0, mirror = 1;
+function fitView() {
+  var m = Math.min(W, H) * 0.09 + 20;
+  var b = GEO.bounds;
+  view.scale = Math.min((W - 2 * m) / b.w, (H - 2 * m) / b.h);
+  view.cx = W / 2; view.cy = H / 2;
+}
+/* rotate/mirror abstract point around bounds center, then screen transform */
+var T = { a: 1, d: 1, e: 0, f: 0 };
+function buildT() {
+  fitView();
+  var b = GEO.bounds;
+  var ox = -(b.x + b.w / 2), oy = -(b.y + b.h / 2);   /* center abstract rect on 0,0 */
+  var c = Math.cos(rot), s = Math.sin(rot), ms = mirror;
+  /* p' = S * R * M * (p + o) ; M mirrors x, S uniform scale */
+  var mx = ms * c, my = s, ny = ms * s, ny2 = c;      /* [ms*c, s ; ms*s, c] */
+  T.a = view.scale * mx; T.d = view.scale * ny2;
+  var bx = view.scale * (mx * ox + my * oy);
+  var by = view.scale * (ny * ox + ny2 * oy);
+  T.e = view.cx + bx; T.f = view.cy + by;
+}
+function ax(x, y) { return T.a * x + T.e; }
+function ay(x, y) { return T.d * y + T.f; }
+
+/* flatten arcs to a polyline with constant arc-length steps (screen px) */
+var PTS = [], TOTAL = 0, BOUNDARY = [];   /* cum-length where pen crosses each new square */
+function resample() {
+  PTS = []; BOUNDARY = []; TOTAL = 0;
+  var step = 4, i, j, arc, n, th, p;
+  PTS.push({ x: GEO.arcs[0].cx + Math.cos(GEO.arcs[0].a0) * GEO.arcs[0].r,
+             y: GEO.arcs[0].cy + Math.sin(GEO.arcs[0].a0) * GEO.arcs[0].r, cum: 0 });
+  for (i = 0; i < GEO.arcs.length; i++) {
+    arc = GEO.arcs[i];
+    var L = Math.PI / 2 * arc.r;
+    n = Math.max(6, Math.ceil(L * view.scale / step));
+    for (j = 1; j <= n; j++) {
+      th = arc.a0 - (Math.PI / 2) * (j / n);
+      p = { x: arc.cx + Math.cos(th) * arc.r, y: arc.cy + Math.sin(th) * arc.r };
+      var prev = PTS[PTS.length - 1];
+      var dx = p.x - prev.x, dy = p.y - prev.y;
+      p.cum = prev.cum + Math.sqrt(dx * dx + dy * dy) * view.scale;
+      PTS.push(p);
+    }
+    BOUNDARY.push(PTS[PTS.length - 1].cum);
+  }
+  TOTAL = PTS[PTS.length - 1].cum;
+  window.__probe.total = Math.round(TOTAL);
+}
+
+/* ---------------- state ---------------- */
+var hueBase = Math.random() * 360;
+var spread = 150;
+var rainbowT = 0;
+var penDist = 0, penSpeed = 46;
+var drawnIdx = 0;
+var phase = [];
+var particles = [];
+var flash = 0;
+var doneT = 0;
+var paused = false;
+var nextEvent = 0;
+var lastSq = -1;
+
+function newRun() {
+  rot = [0, Math.PI / 2, Math.PI, 3 * Math.PI / 2][Math.floor(Math.random() * 4)];
+  mirror = Math.random() < 0.5 ? -1 : 1;
+  buildT(); resample();
+  phase = PTS.map(function () { return Math.random(); });
+  penDist = 0; drawnIdx = 0; penSpeed = 42 + Math.random() * 22;
+  hueBase = Math.random() * 360; spread = 120 + Math.random() * 120;
+  particles = []; flash = 1; doneT = 0; lastSq = -1;
+}
+
+/* ---------------- palette events: colors mutate randomly ---------------- */
+function paletteEvent() {
+  hueBase = (hueBase + 90 + Math.random() * 180) % 360;
+  if (Math.random() < 0.3) { rainbowT = 3; }                     /* brief hue-spread surge */
+  if (Math.random() < 0.25) { spread = 90 + Math.random() * 300; }
+  flash = Math.max(flash, 0.35);
+}
+
+/* ---------------- sizing ---------------- */
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = canvas.width = Math.floor(window.innerWidth * DPR);
+  H = canvas.height = Math.floor(window.innerHeight * DPR);
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  buildT(); resample();
+  vignette = document.createElement('canvas');
+  vignette.width = W; vignette.height = H;
+  var v = vignette.getContext('2d');
+  var g = v.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.72);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,10,0.55)');
+  v.fillStyle = g; v.fillRect(0, 0, W, H);
+}
+
+/* ---------------- drawing helpers ---------------- */
+function drawBackground(t) {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#01010a';
+  ctx.fillRect(0, 0, W, H);
+
+  /* faint drifting grid */
+  var gap = 46 * DPR, off = (t * 7 * DPR) % gap, i;
+  var ga = 0.045 + 0.025 * Math.sin(t * 0.6);
+  ctx.strokeStyle = 'rgba(70,90,200,' + ga.toFixed(3) + ')';
+  ctx.lineWidth = DPR;
+  ctx.beginPath();
+  for (i = -gap + off; i < W + gap; i += gap) { ctx.moveTo(i, 0); ctx.lineTo(i, H); }
+  for (i = -gap + off; i < H + gap; i += gap) { ctx.moveTo(0, i); ctx.lineTo(W, i); }
+  ctx.stroke();
+
+  /* soft rotating glow behind the spiral */
+  var g = ctx.createRadialGradient(W / 2, H / 2, 10, W / 2, H / 2, Math.max(W, H) * 0.55);
+  var pulse = 0.05 + 0.028 * Math.sin(t * 1.3) + 0.02 * Math.sin(t * 0.41);
+  g.addColorStop(0, 'hsla(' + (hueBase % 360).toFixed(0) + ',90%,30%,' + pulse.toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function drawSquares(t) {
+  /* construction squares fade in as the pen reaches them */
+  var i, q, a, reach, x1, y1, x2, y2, px, py, pw, ph;
+  ctx.lineWidth = DPR;
+  for (i = 0; i < GEO.sq.length; i++) {
+    q = GEO.sq[i];
+    reach = (i === 0) ? 0 : BOUNDARY[i - 1];
+    if (penDist < reach - 1) continue;
+    a = Math.min(1, (penDist - reach + 1) / 60) * (0.10 + 0.05 * Math.sin(t * 2 + i));
+    /* rotation is a multiple of 90 degrees, so the square stays axis-aligned on screen */
+    x1 = ax(q.x, q.y); y1 = ay(q.x, q.y);
+    x2 = ax(q.x + q.s, q.y + q.s); y2 = ay(q.x + q.s, q.y + q.s);
+    px = Math.min(x1, x2); py = Math.min(y1, y2);
+    pw = Math.abs(x2 - x1); ph = Math.abs(y2 - y1);
+    ctx.strokeStyle = 'hsla(' + ((hueBase + 40) % 360).toFixed(0) + ',80%,62%,' + a.toFixed(3) + ')';
+    ctx.strokeRect(px, py, pw, ph);
+  }
+}
+
+function colorAt(i, t) {
+  var p = PTS[i];
+  var u = p.cum / TOTAL;
+  var spreadNow = spread + (rainbowT > 0 ? 300 * Math.min(1, rainbowT) : 0);
+  var hue = (hueBase + u * spreadNow + t * 22) % 360;
+  var wave = 0.5 + 0.5 * Math.sin(u * 9 - t * 2.6 + Math.sin(t * 0.5) * 2.2);   /* travelling pulse */
+  var flick = 0.85 + 0.15 * Math.sin(t * 9.3 + phase[i] * 6.283 + u * 31);       /* neon flicker */
+  return { hue: hue, wave: wave, flick: flick, u: u };
+}
+
+function drawTrail(t) {
+  var i, c, x1, y1, x2, y2;
+  /* 1) chromatic ghosts: offset red/cyan copies, additive, faint */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 2.4 * DPR;
+  ctx.lineCap = 'round';
+  var offs = [-1.3 * DPR, 1.3 * DPR], gi;
+  var ghue = [330, 180];
+  for (gi = 0; gi < 2; gi++) {
+    ctx.strokeStyle = 'hsla(' + ghue[gi] + ',100%,45%,0.16)';
+    ctx.beginPath();
+    for (i = 1; i <= drawnIdx; i++) {
+      x1 = ax(PTS[i - 1].x, PTS[i - 1].y) + offs[gi];
+      y1 = ay(PTS[i - 1].x, PTS[i - 1].y) + offs[gi] * 0.6;
+      x2 = ax(PTS[i].x, PTS[i].y) + offs[gi];
+      y2 = ay(PTS[i].x, PTS[i].y) + offs[gi] * 0.6;
+      ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    }
+    ctx.stroke();
+  }
+
+  /* 2) halo: additive but LOW lightness so stacking cannot blow to white */
+  ctx.lineWidth = (7.5 + 3.5 * Math.sin(t * 2.1)) * DPR;
+  for (i = 1; i <= drawnIdx; i++) {
+    c = colorAt(i, t);
+    ctx.strokeStyle = 'hsla(' + c.hue.toFixed(1) + ',100%,' + (30 + 12 * c.wave).toFixed(1) + '%,' +
+                      (0.10 + 0.05 * c.wave).toFixed(3) + ')';
+    ctx.beginPath();
+    ctx.moveTo(ax(PTS[i - 1].x, PTS[i - 1].y), ay(PTS[i - 1].x, PTS[i - 1].y));
+    ctx.lineTo(ax(PTS[i].x, PTS[i].y), ay(PTS[i].x, PTS[i].y));
+    ctx.stroke();
+  }
+
+  /* 3) saturated core in source-over: hues survive the halo */
+  ctx.lineWidth = 2.2 * DPR;
+  for (i = 1; i <= drawnIdx; i++) {
+    c = colorAt(i, t);
+    ctx.strokeStyle = 'hsla(' + c.hue.toFixed(1) + ',100%,' + (56 + 16 * c.wave * c.flick).toFixed(1) + '%,0.92)';
+    ctx.beginPath();
+    ctx.moveTo(ax(PTS[i - 1].x, PTS[i - 1].y), ay(PTS[i - 1].x, PTS[i - 1].y));
+    ctx.lineTo(ax(PTS[i].x, PTS[i].y), ay(PTS[i].x, PTS[i].y));
+    ctx.stroke();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawTip(t) {
+  var p = PTS[drawnIdx];
+  var x = ax(p.x, p.y), y = ay(p.x, p.y);
+  var c = colorAt(Math.max(0, drawnIdx), t);
+  var R = (34 + 12 * Math.sin(t * 8.5)) * DPR;
+
+  ctx.globalCompositeOperation = 'lighter';
+  var g = ctx.createRadialGradient(x, y, 0, x, y, R);
+  g.addColorStop(0, 'hsla(' + c.hue.toFixed(1) + ',100%,72%,0.55)');
+  g.addColorStop(0.35, 'hsla(' + c.hue.toFixed(1) + ',100%,50%,0.18)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, R, 0, 6.2832); ctx.fill();
+
+  /* bright pen core */
+  ctx.shadowBlur = 22 * DPR;
+  ctx.shadowColor = 'hsla(' + c.hue.toFixed(1) + ',100%,65%,1)';
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  ctx.beginPath(); ctx.arc(x, y, 2.6 * DPR, 0, 6.2832); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  /* particles shed tangentially */
+  if (!paused && drawnIdx < PTS.length - 1) {
+    var q = PTS[Math.min(PTS.length - 1, drawnIdx + 2)];
+    var dx = ax(q.x, q.y) - x, dy = ay(q.x, q.y) - y;
+    var l = Math.sqrt(dx * dx + dy * dy) || 1;
+    for (var n = 0; n < 2; n++) {
+      particles.push({
+        x: x, y: y,
+        vx: dx / l * (20 + Math.random() * 45) * DPR + (Math.random() - 0.5) * 34 * DPR,
+        vy: dy / l * (20 + Math.random() * 45) * DPR + (Math.random() - 0.5) * 34 * DPR - 14 * DPR,
+        life: 1, hue: c.hue + (Math.random() - 0.5) * 40,
+        r: (0.9 + Math.random() * 1.7) * DPR
+      });
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawParticles(dt) {
+  ctx.globalCompositeOperation = 'lighter';
+  var i, p;
+  for (i = particles.length - 1; i >= 0; i--) {
+    p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 26 * DPR * dt; p.vx *= 0.985; p.vy *= 0.985;
+    p.life -= dt * (0.75 + Math.random() * 0.5);
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.fillStyle = 'hsla(' + p.hue.toFixed(0) + ',100%,68%,' + (0.55 * p.life).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * p.life, 0, 6.2832); ctx.fill();
+  }
+  if (particles.length > 420) particles.splice(0, particles.length - 420);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawFlash(t) {
+  if (flash <= 0.001) return;
+  ctx.globalCompositeOperation = 'lighter';
+  var g = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.6);
+  g.addColorStop(0, 'hsla(' + (hueBase % 360).toFixed(0) + ',100%,60%,' + (0.22 * flash).toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------------- main loop ---------------- */
+var lastT = 0;
+function loop(now) {
+  window.__probe.frames++;
+  try {
+    var t = now / 1000;
+    var dt = Math.min(0.05, t - lastT || 0.016);
+    lastT = t;
+
+    if (!paused) {
+      if (doneT > 0) {
+        doneT += dt;
+        if (doneT > 6) newRun();                      /* replay: fresh palette + orientation */
+      } else {
+        penDist += penSpeed * DPR * dt;
+        if (penDist >= TOTAL) { penDist = TOTAL; doneT = 0.001; }
+        var target = 0;
+        while (target < PTS.length && PTS[target].cum <= penDist) target++;
+        drawnIdx = Math.max(0, Math.min(PTS.length - 1, target - 1));
+
+        /* spark burst each time the pen crosses into a new square */
+        var b = 0;
+        for (b = 0; b < BOUNDARY.length; b++) if (BOUNDARY[b] > penDist) break;
+        if (b - 1 > lastSq) {
+          lastSq = b - 1;
+          flash = Math.max(flash, 0.5);
+          var p0 = PTS[drawnIdx], x0 = ax(p0.x, p0.y), y0 = ay(p0.x, p0.y);
+          for (var s2 = 0; s2 < 14; s2++) {
+            var a = Math.random() * 6.2832, v = (60 + Math.random() * 120) * DPR;
+            particles.push({ x: x0, y: y0, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+              life: 1, hue: hueBase + Math.random() * 120, r: (1 + Math.random() * 2) * DPR });
+          }
+        }
+      }
+      if (rainbowT > 0) rainbowT -= dt;
+      if (flash > 0) flash = Math.max(0, flash - dt * 1.4);
+      if (t > nextEvent) { paletteEvent(); nextEvent = t + 3.5 + Math.random() * 5.5; }
+    }
+
+    drawBackground(t);
+    drawSquares(t);
+    drawTrail(t);
+    drawParticles(dt);
+    drawTip(t);
+    drawFlash(t);
+    if (vignette) { ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(vignette, 0, 0); }
+
+    window.__probe.drawn = drawnIdx;
+    window.__probe.spiral = {
+      arcs: GEO.arcs.length,
+      cornersOK: GEO.cornersOK,
+      pts: PTS.length,
+      buildErr: GEO.err
+    };
+  } catch (e) {
+    window.__probe.err = (e && e.message) || String(e);
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---------------- input ---------------- */
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', function (ev) {
+  if (ev.code === 'Space') { paused = !paused; ev.preventDefault(); }
+  else if (ev.key === 'r' || ev.key === 'R') newRun();
+});
+window.addEventListener('pointerdown', function () {
+  paletteEvent();
+  flash = Math.max(flash, 0.5);
+});
+
+resize();
+newRun();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
